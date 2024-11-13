@@ -163,6 +163,72 @@ public:
 
             return result == 1;
         }
+    
+    static std::string getSharedKey(const std::string& secretKeyHex, const std::string& publicKeyHex) {
+            EC_KEY* privateKey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+            if (!privateKey) {
+                throw std::runtime_error("Failed to create EC_KEY for private key");
+            }
+
+            // 개인키 설정
+            BIGNUM* priv = BN_new();
+            std::vector<unsigned char> secretKeyBytes = hexToBytes(secretKeyHex);
+            BN_bin2bn(secretKeyBytes.data(), secretKeyBytes.size(), priv);
+            if (!EC_KEY_set_private_key(privateKey, priv)) {
+                BN_free(priv);
+                EC_KEY_free(privateKey);
+                throw std::runtime_error("Failed to set private key");
+            }
+
+            // 공개키 포인트 생성
+            const EC_GROUP* group = EC_KEY_get0_group(privateKey);
+            EC_POINT* pub = EC_POINT_new(group);
+            std::vector<unsigned char> publicKeyBytes = hexToBytes(publicKeyHex);
+            
+            if (!EC_POINT_oct2point(group, pub, publicKeyBytes.data(), publicKeyBytes.size(), nullptr)) {
+                EC_POINT_free(pub);
+                BN_free(priv);
+                EC_KEY_free(privateKey);
+                throw std::runtime_error("Failed to create public key point");
+            }
+
+            // 공유 비밀 계산
+            unsigned char sharedSecret[32];
+            BIGNUM* sharedSecretBN = BN_new();
+            EC_POINT* sharedPoint = EC_POINT_new(group);
+            
+            // 공유 포인트 계산: publicKey * privateKey
+            if (!EC_POINT_mul(group, sharedPoint, nullptr, pub, priv, nullptr)) {
+                BN_free(sharedSecretBN);
+                EC_POINT_free(sharedPoint);
+                EC_POINT_free(pub);
+                BN_free(priv);
+                EC_KEY_free(privateKey);
+                throw std::runtime_error("Failed to compute shared point");
+            }
+
+            // x 좌표만 추출
+            if (!EC_POINT_get_affine_coordinates(group, sharedPoint, sharedSecretBN, nullptr, nullptr)) {
+                BN_free(sharedSecretBN);
+                EC_POINT_free(sharedPoint);
+                EC_POINT_free(pub);
+                BN_free(priv);
+                EC_KEY_free(privateKey);
+                throw std::runtime_error("Failed to get shared secret");
+            }
+
+            // BIGNUM을 바이트 배열로 변환
+            BN_bn2binpad(sharedSecretBN, sharedSecret, 32);
+
+            // 정리
+            BN_free(sharedSecretBN);
+            EC_POINT_free(sharedPoint);
+            EC_POINT_free(pub);
+            BN_free(priv);
+            EC_KEY_free(privateKey);
+
+            return bytesToHex(sharedSecret, 32);
+        }
 
 };
 
@@ -186,6 +252,22 @@ int main() {
         // 4. 서명 검증
         bool isValid = SECP256R1Crypto::verify(signature, message, publicKey);
         std::cout << "Signature Valid: " << (isValid ? "Yes" : "No") << std::endl;
+        
+        // 5. 공유키 생성
+        std::string alicePrivateKey = SECP256R1Crypto::generatePrivateKey();
+        std::string alicePublicKey = SECP256R1Crypto::derivePublicKey(alicePrivateKey);
+
+        std::string bobPrivateKey = SECP256R1Crypto::generatePrivateKey();
+        std::string bobPublicKey = SECP256R1Crypto::derivePublicKey(bobPrivateKey);
+
+        std::string sharedKey1 = SECP256R1Crypto::getSharedKey(alicePrivateKey, bobPublicKey);
+        std::string sharedKey2 = SECP256R1Crypto::getSharedKey(bobPrivateKey, alicePublicKey);
+        
+        std::cout << "SharedKey Value: " << sharedKey1 << std::endl;
+        std::cout << "SharedKey Valid: " << (sharedKey1 == sharedKey2 ? "Yes" : "No") << std::endl;
+        
+        
+        
     }
     catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
@@ -193,7 +275,8 @@ int main() {
     
     
     try {
-        // 실패 테스트
+        // 서명 검증 실패 테스트
+        std::cout << "------------------------" << std::endl << std::endl;
         std::cout << "실패 테스트" << std::endl;
         // 1. 개인키 생성
         std::string privateKey = SECP256R1Crypto::generatePrivateKey();
@@ -211,6 +294,7 @@ int main() {
         // 4. 서명 검증
         bool isValid = SECP256R1Crypto::verify(signature, message, publicKey);
         std::cout << "Signature Valid: " << (isValid ? "Yes" : "No") << std::endl;
+        std::cout << "Signature Valid: " << (isValid ? "실패 테스트 실패" : "실패 테스트 성공") << std::endl;
     }
     catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
