@@ -4,13 +4,15 @@
 #include <openssl/evp.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#include <openssl/aes.h>
 #include <string>
 #include <vector>
 #include <sstream>
 #include <iomanip>
 #include <iostream>
+#include <stdexcept>
 
-class SECP256R1Crypto {
+class Crypto {
 private:
     static std::string bytesToHex(const unsigned char* data, size_t len) {
         std::stringstream ss;
@@ -229,6 +231,152 @@ public:
 
             return bytesToHex(sharedSecret, 32);
         }
+    
+    static std::string encrypt(const std::string& key, const std::string& msg) {
+            unsigned char nonce[12];
+            if (RAND_bytes(nonce, sizeof(nonce)) != 1) {
+                throw std::runtime_error("Failed to generate nonce");
+            }
+
+            unsigned char keyHash[32];
+            EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+            EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr);
+            EVP_DigestUpdate(mdctx, key.c_str(), key.length());
+            EVP_DigestFinal_ex(mdctx, keyHash, nullptr);
+            EVP_MD_CTX_free(mdctx);
+
+            unsigned char tag[16];
+            
+            std::vector<unsigned char> ciphertext(msg.length());
+            int ciphertext_len;
+
+            // CCM 컨텍스트 초기화
+            EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+            if (!ctx) {
+                throw std::runtime_error("Failed to create cipher context");
+            }
+
+            // CCM 모드 초기화
+            if (!EVP_EncryptInit_ex(ctx, EVP_aes_128_ccm(), nullptr, nullptr, nullptr)) {
+                EVP_CIPHER_CTX_free(ctx);
+                throw std::runtime_error("Failed to initialize CCM mode");
+            }
+
+            // CCM 파라미터 설정
+            if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_CCM_SET_IVLEN, sizeof(nonce), nullptr) ||
+                !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_CCM_SET_TAG, sizeof(tag), nullptr)) {
+                EVP_CIPHER_CTX_free(ctx);
+                throw std::runtime_error("Failed to set CCM parameters");
+            }
+
+            // 키와 nonce로 암호화 초기화
+            if (!EVP_EncryptInit_ex(ctx, nullptr, nullptr, keyHash, nonce)) {
+                EVP_CIPHER_CTX_free(ctx);
+                throw std::runtime_error("Failed to initialize encryption");
+            }
+
+            // 평문 길이 설정
+            if (!EVP_EncryptUpdate(ctx, nullptr, &ciphertext_len, nullptr, msg.length())) {
+                EVP_CIPHER_CTX_free(ctx);
+                throw std::runtime_error("Failed to set message length");
+            }
+
+            // 암호화 수행
+            if (!EVP_EncryptUpdate(ctx, ciphertext.data(), &ciphertext_len,
+                                  reinterpret_cast<const unsigned char*>(msg.c_str()), msg.length())) {
+                EVP_CIPHER_CTX_free(ctx);
+                throw std::runtime_error("Failed to encrypt message");
+            }
+
+            // 암호화 종료 및 태그 얻기
+            if (!EVP_EncryptFinal_ex(ctx, ciphertext.data() + ciphertext_len, &ciphertext_len)) {
+                EVP_CIPHER_CTX_free(ctx);
+                throw std::runtime_error("Failed to finalize encryption");
+            }
+
+            if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_CCM_GET_TAG, 16, tag)) {
+                EVP_CIPHER_CTX_free(ctx);
+                throw std::runtime_error("Failed to get tag");
+            }
+
+            EVP_CIPHER_CTX_free(ctx);
+
+            // nonce(12) + ciphertext + tag(16)를 하나의 문자열로 결합
+            std::string result;
+            result.reserve(12 + msg.length() + 16);
+            result.append(reinterpret_cast<char*>(nonce), 12);
+            result.append(reinterpret_cast<char*>(ciphertext.data()), msg.length());
+            result.append(reinterpret_cast<char*>(tag), 16);
+
+            return bytesToHex(reinterpret_cast<const unsigned char*>(result.c_str()), result.length());
+        }
+
+        static std::string decrypt(const std::string& key, const std::string& encryptedHex) {
+            // 16진수 문자열을 바이트로 변환
+            std::vector<unsigned char> encrypted = hexToBytes(encryptedHex);
+            if (encrypted.size() < 28) { // 최소 nonce(12) + tag(16) 필요
+                throw std::runtime_error("Invalid encrypted data length");
+            }
+
+            // 키 해시 생성
+            unsigned char keyHash[32];
+            EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+            EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr);
+            EVP_DigestUpdate(mdctx, key.c_str(), key.length());
+            EVP_DigestFinal_ex(mdctx, keyHash, nullptr);
+            EVP_MD_CTX_free(mdctx);
+
+            // nonce, ciphertext, tag 분리
+            unsigned char* nonce = encrypted.data();
+            size_t ciphertext_len = encrypted.size() - 28;
+            unsigned char* ciphertext = encrypted.data() + 12;
+            unsigned char* tag = encrypted.data() + encrypted.size() - 16;
+
+            // 복호화할 평문 버퍼
+            std::vector<unsigned char> plaintext(ciphertext_len);
+            int plaintext_len;
+
+            // CCM 컨텍스트 초기화
+            EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+            if (!ctx) {
+                throw std::runtime_error("Failed to create cipher context");
+            }
+
+            // CCM 모드 초기화
+            if (!EVP_DecryptInit_ex(ctx, EVP_aes_128_ccm(), nullptr, nullptr, nullptr)) {
+                EVP_CIPHER_CTX_free(ctx);
+                throw std::runtime_error("Failed to initialize CCM mode");
+            }
+
+            // CCM 파라미터 설정
+            if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_CCM_SET_IVLEN, 12, nullptr) ||
+                !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_CCM_SET_TAG, 16, tag)) {
+                EVP_CIPHER_CTX_free(ctx);
+                throw std::runtime_error("Failed to set CCM parameters");
+            }
+
+            // 키와 nonce로 복호화 초기화
+            if (!EVP_DecryptInit_ex(ctx, nullptr, nullptr, keyHash, nonce)) {
+                EVP_CIPHER_CTX_free(ctx);
+                throw std::runtime_error("Failed to initialize decryption");
+            }
+
+            // 암호문 길이 설정
+            if (!EVP_DecryptUpdate(ctx, nullptr, &plaintext_len, nullptr, ciphertext_len)) {
+                EVP_CIPHER_CTX_free(ctx);
+                throw std::runtime_error("Failed to set ciphertext length");
+            }
+
+            // 복호화 수행
+            if (!EVP_DecryptUpdate(ctx, plaintext.data(), &plaintext_len, ciphertext, ciphertext_len)) {
+                EVP_CIPHER_CTX_free(ctx);
+                throw std::runtime_error("Failed to decrypt message or tag verification failed");
+            }
+
+            EVP_CIPHER_CTX_free(ctx);
+
+            return std::string(reinterpret_cast<char*>(plaintext.data()), plaintext_len);
+        }
 
 };
 
@@ -237,36 +385,44 @@ public:
 int main() {
     try {
         // 개인키 생성
-        std::string privateKey = SECP256R1Crypto::generatePrivateKey();
+        std::string privateKey = Crypto::generatePrivateKey();
         std::cout << "Private Key: " << privateKey << std::endl;
 
         // 공개키 파생
-        std::string publicKey = SECP256R1Crypto::derivePublicKey(privateKey);
+        std::string publicKey = Crypto::derivePublicKey(privateKey);
         std::cout << "Public Key: " << publicKey << std::endl;
         
         // 3. 메시지 서명
-        std::string message = "Hello, World!";
-        std::string signature = SECP256R1Crypto::sign(message, privateKey);
+        std::string message = "Hello, World!!!!!!!!";
+        std::string signature = Crypto::sign(message, privateKey);
         std::cout << "Signature: " << signature << std::endl;
 
         // 4. 서명 검증
-        bool isValid = SECP256R1Crypto::verify(signature, message, publicKey);
+        bool isValid = Crypto::verify(signature, message, publicKey);
         std::cout << "Signature Valid: " << (isValid ? "Yes" : "No") << std::endl;
         
         // 5. 공유키 생성
-        std::string alicePrivateKey = SECP256R1Crypto::generatePrivateKey();
-        std::string alicePublicKey = SECP256R1Crypto::derivePublicKey(alicePrivateKey);
+        std::string alicePrivateKey = Crypto::generatePrivateKey();
+        std::string alicePublicKey = Crypto::derivePublicKey(alicePrivateKey);
 
-        std::string bobPrivateKey = SECP256R1Crypto::generatePrivateKey();
-        std::string bobPublicKey = SECP256R1Crypto::derivePublicKey(bobPrivateKey);
+        std::string bobPrivateKey = Crypto::generatePrivateKey();
+        std::string bobPublicKey = Crypto::derivePublicKey(bobPrivateKey);
 
-        std::string sharedKey1 = SECP256R1Crypto::getSharedKey(alicePrivateKey, bobPublicKey);
-        std::string sharedKey2 = SECP256R1Crypto::getSharedKey(bobPrivateKey, alicePublicKey);
+        std::string sharedKey1 = Crypto::getSharedKey(alicePrivateKey, bobPublicKey);
+        std::string sharedKey2 = Crypto::getSharedKey(bobPrivateKey, alicePublicKey);
         
         std::cout << "SharedKey Value: " << sharedKey1 << std::endl;
         std::cout << "SharedKey Valid: " << (sharedKey1 == sharedKey2 ? "Yes" : "No") << std::endl;
         
-        
+        // 6. 암호화 및 복호화
+
+        // 암호화
+        std::string encrypted = Crypto::encrypt(sharedKey1, message);
+        std::cout << "Encrypted: " << encrypted << std::endl;
+
+        // 복호화
+        std::string decrypted = Crypto::decrypt(sharedKey2, encrypted);
+        std::cout << "Decrypted: " << decrypted << std::endl;
         
     }
     catch (const std::exception& e) {
@@ -279,11 +435,11 @@ int main() {
         std::cout << "------------------------" << std::endl << std::endl;
         std::cout << "실패 테스트" << std::endl;
         // 1. 개인키 생성
-        std::string privateKey = SECP256R1Crypto::generatePrivateKey();
+        std::string privateKey = Crypto::generatePrivateKey();
         std::cout << "Private Key: " << privateKey << std::endl;
 
         // 2. 공개키 파생
-        std::string publicKey = SECP256R1Crypto::derivePublicKey(privateKey);
+        std::string publicKey = Crypto::derivePublicKey(privateKey);
         std::cout << "Public Key: " << publicKey << std::endl;
 
         // 3. 메시지 서명
@@ -292,7 +448,7 @@ int main() {
         std::cout << "Signature: " << signature << std::endl;
 
         // 4. 서명 검증
-        bool isValid = SECP256R1Crypto::verify(signature, message, publicKey);
+        bool isValid = Crypto::verify(signature, message, publicKey);
         std::cout << "Signature Valid: " << (isValid ? "Yes" : "No") << std::endl;
         std::cout << "Signature Valid: " << (isValid ? "실패 테스트 실패" : "실패 테스트 성공") << std::endl;
     }
