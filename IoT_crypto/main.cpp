@@ -12,7 +12,7 @@
 #include <iostream>
 #include <stdexcept>
 
-class Crypto {
+class MatterTunnel {
 private:
     static std::string bytesToHex(const unsigned char* data, size_t len) {
         std::stringstream ss;
@@ -32,6 +32,36 @@ private:
         }
         return bytes;
     }
+    
+    static std::string getTypeString(uint16_t types) {
+            std::string result;
+            // 상위 14비트에서 7개의 2비트 패턴 처리 (인자)
+            for (int i = 6; i >= 0; i--) {
+                uint16_t argType = (types >> (i * 2 + 2)) & 0x03;
+                if (argType == 0x00) break; // void는 더 이상의 인자가 없음을 의미
+                
+                if (result.length() > 0) result += ",";
+                
+                switch(argType) {
+                    case 0x01: result += "string"; break;
+                    case 0x02: result += "number"; break;
+                    case 0x03: result += "Boolean"; break;
+                }
+            }
+        
+        result += ")";
+            
+            // 하위 2비트 처리 (반환값)
+            std::string returnType;
+            switch(types & 0x03) {
+                case 0x00: returnType = "void"; break;
+                case 0x01: returnType = "string"; break;
+                case 0x02: returnType = "number"; break;
+                case 0x03: returnType = "Boolean"; break;
+            }
+            
+            return result + "->" + returnType;
+        }
 
 public:
     // 시크릿키 생성 (64자리 16진수 문자열 반환)
@@ -165,7 +195,7 @@ public:
 
             return result == 1;
         }
-    
+    // 공유키 생성
     static std::string getSharedKey(const std::string& secretKeyHex, const std::string& publicKeyHex) {
             EC_KEY* privateKey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
             if (!privateKey) {
@@ -232,6 +262,7 @@ public:
             return bytesToHex(sharedSecret, 32);
         }
     
+    // 암호화
     static std::string encrypt(const std::string& key, const std::string& msg) {
             unsigned char nonce[12];
             if (RAND_bytes(nonce, sizeof(nonce)) != 1) {
@@ -310,7 +341,8 @@ public:
 
             return bytesToHex(reinterpret_cast<const unsigned char*>(result.c_str()), result.length());
         }
-
+    
+        // 복호화
         static std::string decrypt(const std::string& key, const std::string& encryptedHex) {
             // 16진수 문자열을 바이트로 변환
             std::vector<unsigned char> encrypted = hexToBytes(encryptedHex);
@@ -377,7 +409,74 @@ public:
 
             return std::string(reinterpret_cast<char*>(plaintext.data()), plaintext_len);
         }
+    
+    // 디바이스 정보 추출
+    static std::string ExtractDeviceInfo(const std::vector<unsigned char>& data) {
+            if (data.size() < 49) { // 최소 크기: publicKey(33) + passcode(16)
+                throw std::runtime_error("Invalid data size");
+            }
 
+            // 1. Public Key 처리
+            std::vector<unsigned char> compressedKey(data.begin(), data.begin() + 33);
+            
+            // compressed public key를 uncompressed form으로 변환
+            EC_KEY* key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+            const EC_GROUP* group = EC_KEY_get0_group(key);
+            EC_POINT* point = EC_POINT_new(group);
+            
+            if (!EC_POINT_oct2point(group, point, compressedKey.data(), compressedKey.size(), nullptr)) {
+                EC_POINT_free(point);
+                EC_KEY_free(key);
+                throw std::runtime_error("Failed to decompress public key");
+            }
+
+            unsigned char uncompressedKey[65];
+            size_t uncompressedLen = EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED,
+                                                       uncompressedKey, 65, nullptr);
+
+            // 2. Passcode 처리
+            std::vector<unsigned char> passcode(data.begin() + 33, data.begin() + 49);
+
+            // 3. Functions 처리
+            std::vector<std::string> functions;
+            size_t pos = 49;
+            
+            while (pos + 20 <= data.size()) {
+                // Function name (18 bytes)
+                std::string funcName;
+                for (size_t i = 0; i < 18; i++) {
+                    if (data[pos + i] != 0) {
+                        funcName += static_cast<char>(data[pos + i]);
+                    }
+                }
+                
+                // Function types (2 bytes)
+                uint16_t types = (data[pos + 18] << 8) | data[pos + 19];
+                
+                // Function signature 생성
+                std::string funcSig = funcName + "(" + getTypeString(types);
+                functions.push_back(funcSig);
+                
+                pos += 20;
+            }
+
+            // JSON 형식의 출력 생성
+            std::stringstream json;
+            json << "{\"publicKey\":\"" << bytesToHex(uncompressedKey, uncompressedLen)
+                 << "\",\"passcode\":\"" << bytesToHex(passcode.data(), passcode.size())
+                 << "\",\"functions\":[";
+            
+            for (size_t i = 0; i < functions.size(); i++) {
+                if (i > 0) json << ",";
+                json << "\"" << functions[i] << "\"";
+            }
+            json << "]}";
+
+            EC_POINT_free(point);
+            EC_KEY_free(key);
+
+            return json.str();
+        }
 };
 
 
@@ -385,31 +484,31 @@ public:
 int main() {
     try {
         // 개인키 생성
-        std::string privateKey = Crypto::generatePrivateKey();
+        std::string privateKey = MatterTunnel::generatePrivateKey();
         std::cout << "Private Key: " << privateKey << std::endl;
 
         // 공개키 파생
-        std::string publicKey = Crypto::derivePublicKey(privateKey);
+        std::string publicKey = MatterTunnel::derivePublicKey(privateKey);
         std::cout << "Public Key: " << publicKey << std::endl;
         
         // 3. 메시지 서명
         std::string message = "Hello, World!!!!!!!!";
-        std::string signature = Crypto::sign(message, privateKey);
+        std::string signature = MatterTunnel::sign(message, privateKey);
         std::cout << "Signature: " << signature << std::endl;
 
         // 4. 서명 검증
-        bool isValid = Crypto::verify(signature, message, publicKey);
+        bool isValid = MatterTunnel::verify(signature, message, publicKey);
         std::cout << "Signature Valid: " << (isValid ? "Yes" : "No") << std::endl;
         
         // 5. 공유키 생성
-        std::string alicePrivateKey = Crypto::generatePrivateKey();
-        std::string alicePublicKey = Crypto::derivePublicKey(alicePrivateKey);
+        std::string alicePrivateKey = MatterTunnel::generatePrivateKey();
+        std::string alicePublicKey = MatterTunnel::derivePublicKey(alicePrivateKey);
 
-        std::string bobPrivateKey = Crypto::generatePrivateKey();
-        std::string bobPublicKey = Crypto::derivePublicKey(bobPrivateKey);
+        std::string bobPrivateKey = MatterTunnel::generatePrivateKey();
+        std::string bobPublicKey = MatterTunnel::derivePublicKey(bobPrivateKey);
 
-        std::string sharedKey1 = Crypto::getSharedKey(alicePrivateKey, bobPublicKey);
-        std::string sharedKey2 = Crypto::getSharedKey(bobPrivateKey, alicePublicKey);
+        std::string sharedKey1 = MatterTunnel::getSharedKey(alicePrivateKey, bobPublicKey);
+        std::string sharedKey2 = MatterTunnel::getSharedKey(bobPrivateKey, alicePublicKey);
         
         std::cout << "SharedKey Value: " << sharedKey1 << std::endl;
         std::cout << "SharedKey Valid: " << (sharedKey1 == sharedKey2 ? "Yes" : "No") << std::endl;
@@ -417,11 +516,11 @@ int main() {
         // 6. 암호화 및 복호화
 
         // 암호화
-        std::string encrypted = Crypto::encrypt(sharedKey1, message);
+        std::string encrypted = MatterTunnel::encrypt(sharedKey1, message);
         std::cout << "Encrypted: " << encrypted << std::endl;
 
         // 복호화
-        std::string decrypted = Crypto::decrypt(sharedKey2, encrypted);
+        std::string decrypted = MatterTunnel::decrypt(sharedKey2, encrypted);
         std::cout << "Decrypted: " << decrypted << std::endl;
         
     }
@@ -435,11 +534,11 @@ int main() {
         std::cout << "------------------------" << std::endl << std::endl;
         std::cout << "실패 테스트" << std::endl;
         // 1. 개인키 생성
-        std::string privateKey = Crypto::generatePrivateKey();
+        std::string privateKey = MatterTunnel::generatePrivateKey();
         std::cout << "Private Key: " << privateKey << std::endl;
 
         // 2. 공개키 파생
-        std::string publicKey = Crypto::derivePublicKey(privateKey);
+        std::string publicKey = MatterTunnel::derivePublicKey(privateKey);
         std::cout << "Public Key: " << publicKey << std::endl;
 
         // 3. 메시지 서명
@@ -448,11 +547,37 @@ int main() {
         std::cout << "Signature: " << signature << std::endl;
 
         // 4. 서명 검증
-        bool isValid = Crypto::verify(signature, message, publicKey);
+        bool isValid = MatterTunnel::verify(signature, message, publicKey);
         std::cout << "Signature Valid: " << (isValid ? "Yes" : "No") << std::endl;
         std::cout << "Signature Valid: " << (isValid ? "실패 테스트 실패" : "실패 테스트 성공") << std::endl;
     }
     catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+    
+    try{
+        // 디바이스 정보 추출
+        std::vector<unsigned char> deviceData = {
+           // 33bytes compressed public key
+           0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+           0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+           0x20, 0x21, 0x22,
+           
+           // 16bytes passcode
+           0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
+           
+           // 20bytes function 1 - getTemp() -> number
+           'g','e','t','T','e','m','p',0,0,0,0,0,0,0,0,0,0,0,
+           0x00, 0x02,  // no args, returns number
+           
+           // 20bytes function 2 - setLED(number,Boolean) -> void
+           's','e','t','L','E','D',0,0,0,0,0,0,0,0,0,0,0,0,
+           0x8C, 0x00   // number,Boolean args, returns void
+        };
+        
+        std::string deviceInfo = MatterTunnel::ExtractDeviceInfo(deviceData);
+        std::cout << deviceInfo << std::endl;
+    }catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
     }
     
