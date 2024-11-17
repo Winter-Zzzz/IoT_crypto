@@ -62,6 +62,44 @@ private:
             
             return result + "->" + returnType;
         }
+    
+    // 데이터 리스트 직렬화를 위한 메서드
+        static std::vector<unsigned char> serializeDataList(const std::vector<std::string>& dataList) {
+            std::vector<unsigned char> serialized;
+            
+            for (const auto& data : dataList) {
+                // 데이터 길이를 1바이트로 추가
+                unsigned char length = static_cast<unsigned char>(data.length());
+                serialized.push_back(length);
+                
+                // 데이터 추가
+                serialized.insert(serialized.end(), data.begin(), data.end());
+            }
+            
+            return serialized;
+        }
+    
+    // 직렬화된 데이터를 문자열 리스트로 변환하는 새로운 메서드
+       static std::vector<std::string> deserializeDataList(const std::string& serializedData) {
+           std::vector<std::string> result;
+           size_t pos = 0;
+           
+           while (pos < serializedData.length()) {
+               // 데이터 길이 읽기 (1바이트)
+               unsigned char length = static_cast<unsigned char>(serializedData[pos++]);
+               
+               // 데이터 추출
+               if (pos + length <= serializedData.length()) {
+                   result.push_back(serializedData.substr(pos, length));
+                   pos += length;
+               } else {
+                   break;  // 잘못된 형식이면 중단
+               }
+           }
+           
+           return result;
+       }
+
 
 public:
     // 시크릿키 생성 (64자리 16진수 문자열 반환)
@@ -124,7 +162,7 @@ public:
     }
     
     // 서명 생성
-        static std::string sign(const std::string& message, const std::string& privateKeyHex) {
+    static std::string sign(const std::string& message, const std::string& privateKeyHex) {
             EC_KEY* key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
             BIGNUM* priv = BN_new();
             std::vector<unsigned char> privateKeyBytes = hexToBytes(privateKeyHex);
@@ -147,12 +185,22 @@ public:
                 throw std::runtime_error("Failed to create signature");
             }
 
-            // 서명을 DER 형식으로 변환
-            unsigned char *der = nullptr;
-            int derLen = i2d_ECDSA_SIG(signature, &der);
-            std::string signatureHex = bytesToHex(der, derLen);
+            // R, S 값 추출
+            const BIGNUM *r, *s;
+            ECDSA_SIG_get0(signature, &r, &s);
+            
+            // R, S 값을 32바이트 고정 길이로 변환
+            unsigned char rBytes[32] = {0};
+            unsigned char sBytes[32] = {0};
+            BN_bn2binpad(r, rBytes, 32);
+            BN_bn2binpad(s, sBytes, 32);
 
-            OPENSSL_free(der);
+            // R과 S를 연결하여 64바이트 시그니처 생성
+            std::string signatureHex;
+            signatureHex.reserve(128); // 64바이트 * 2
+            signatureHex += bytesToHex(rBytes, 32);
+            signatureHex += bytesToHex(sBytes, 32);
+
             ECDSA_SIG_free(signature);
             BN_free(priv);
             EC_KEY_free(key);
@@ -161,8 +209,12 @@ public:
         }
 
         // 서명 검증
-        static bool verify(const std::string& signatureHex, const std::string& message,
+    static bool verify(const std::string& signatureHex, const std::string& message,
                           const std::string& publicKeyHex) {
+            if (signatureHex.length() != 128) { // 64바이트 시그니처 (R: 32바이트, S: 32바이트)
+                throw std::runtime_error("Invalid signature length");
+            }
+
             EC_KEY* key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
             const EC_GROUP* group = EC_KEY_get0_group(key);
             EC_POINT* pub = EC_POINT_new(group);
@@ -181,20 +233,29 @@ public:
             EVP_DigestFinal_ex(mdctx, hash, nullptr);
             EVP_MD_CTX_free(mdctx);
 
-            // 서명 변환
-            std::vector<unsigned char> sigBytes = hexToBytes(signatureHex);
-            const unsigned char* sigData = sigBytes.data();
-            ECDSA_SIG* signature = d2i_ECDSA_SIG(nullptr, &sigData, sigBytes.size());
+            // R, S 값 추출 및 ECDSA_SIG 구조체 생성
+            std::string rHex = signatureHex.substr(0, 64);
+            std::string sHex = signatureHex.substr(64, 64);
+            std::vector<unsigned char> rBytes = hexToBytes(rHex);
+            std::vector<unsigned char> sBytes = hexToBytes(sHex);
+
+            ECDSA_SIG* signature = ECDSA_SIG_new();
+            BIGNUM* r = BN_new();
+            BIGNUM* s = BN_new();
+            BN_bin2bn(rBytes.data(), rBytes.size(), r);
+            BN_bin2bn(sBytes.data(), sBytes.size(), s);
+            ECDSA_SIG_set0(signature, r, s); // r, s 소유권이 signature로 이전됨
 
             // 검증
             int result = ECDSA_do_verify(hash, sizeof(hash), signature, key);
 
-            ECDSA_SIG_free(signature);
+            ECDSA_SIG_free(signature); // 내부적으로 r, s도 해제됨
             EC_POINT_free(pub);
             EC_KEY_free(key);
 
             return result == 1;
         }
+    
     // 공유키 생성
     static std::string getSharedKey(const std::string& secretKeyHex, const std::string& publicKeyHex) {
             EC_KEY* privateKey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
@@ -477,9 +538,168 @@ public:
 
             return json.str();
         }
+    
+    static std::vector<unsigned char> makeTX(const std::string& funcName,
+                                               const std::string& src_priv,
+                                               const std::string& dest_pub,
+                                               const std::vector<std::string>& data_list) {
+            std::vector<unsigned char> result;
+            
+            // 1. 공유키 생성
+            std::string sharedKey = getSharedKey(src_priv, dest_pub);
+            
+            // 2. src_pub 파생
+            std::string src_pub = derivePublicKey(src_priv);
+            
+            // 압축된 공개키로 변환 (uncompressed -> compressed)
+            std::vector<unsigned char> uncompressedPubBytes = hexToBytes(src_pub);
+            EC_KEY* key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+            const EC_GROUP* group = EC_KEY_get0_group(key);
+            EC_POINT* point = EC_POINT_new(group);
+            EC_POINT_oct2point(group, point, uncompressedPubBytes.data(), uncompressedPubBytes.size(), nullptr);
+            
+            unsigned char compressedKey[33];
+            EC_POINT_point2oct(group, point, POINT_CONVERSION_COMPRESSED, compressedKey, 33, nullptr);
+            
+            // 3. 데이터 직렬화
+            std::vector<unsigned char> serializedData = serializeDataList(data_list);
+            
+            // 4. 직렬화된 데이터 암호화
+            std::string encryptedData = encrypt(sharedKey,
+                std::string(serializedData.begin(), serializedData.end()));
+            std::vector<unsigned char> encryptedBytes = hexToBytes(encryptedData);
+            
+            // 5. 현재 타임스탬프 얻기
+            auto now = std::chrono::system_clock::now();
+            auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                now.time_since_epoch()).count();
+            
+            // 6. TX 데이터 조합
+            // 6.1 Function name (18 bytes)
+            std::string paddedFuncName = funcName;
+            paddedFuncName.resize(18, '\0');
+            result.insert(result.end(), paddedFuncName.begin(), paddedFuncName.end());
+            
+            // 6.2 Compressed public key (33 bytes)
+            result.insert(result.end(), compressedKey, compressedKey + 33);
+            
+            // 6.3 Timestamp (8 bytes)
+            for(int i = 0; i < 8; i++) {
+                result.push_back(static_cast<unsigned char>((timestamp >> (i * 8)) & 0xFF));
+            }
+            
+            // 6.4 Encrypted data
+            result.insert(result.end(), encryptedBytes.begin(), encryptedBytes.end());
+            
+            // 7. 서명 생성 및 추가
+            std::string signature = sign(std::string(result.begin(), result.end()), src_priv);
+            std::vector<unsigned char> signatureBytes = hexToBytes(signature);
+            
+            // 최종 결과: signature + TX data
+            std::vector<unsigned char> finalResult;
+            finalResult.insert(finalResult.end(), signatureBytes.begin(), signatureBytes.end());
+            finalResult.insert(finalResult.end(), result.begin(), result.end());
+            
+            // 정리
+            EC_POINT_free(point);
+            EC_KEY_free(key);
+            
+            return finalResult;
+        }
+    
+    static std::string extractTXData(const std::string& privateKey,
+                                           const std::vector<unsigned char>& txBytes) {
+                if (txBytes.size() < 71) { // 최소 크기: signature(64) + funcName(18) + compressed pubkey(33) + timestamp(8)
+                    throw std::runtime_error("Invalid TX data size");
+                }
+
+                // 1. 서명과 데이터 분리
+                std::vector<unsigned char> signature(txBytes.begin(), txBytes.begin() + 64);
+                std::vector<unsigned char> txData(txBytes.begin() + 64, txBytes.end());
+                
+                // 2. 서명 검증
+                std::string signatureHex = bytesToHex(signature.data(), signature.size());
+                std::string txDataStr(txData.begin(), txData.end());
+                
+                // compressed public key 추출 (33바이트)
+                std::vector<unsigned char> compressedPubKey(txData.begin() + 18, txData.begin() + 51);
+                
+                // compressed public key를 uncompressed form으로 변환
+                EC_KEY* key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+                const EC_GROUP* group = EC_KEY_get0_group(key);
+                EC_POINT* point = EC_POINT_new(group);
+                
+                if (!EC_POINT_oct2point(group, point, compressedPubKey.data(), compressedPubKey.size(), nullptr)) {
+                    EC_POINT_free(point);
+                    EC_KEY_free(key);
+                    throw std::runtime_error("Failed to decompress public key");
+                }
+
+                unsigned char uncompressedKey[65];
+                size_t uncompressedLen = EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED,
+                                                           uncompressedKey, 65, nullptr);
+                
+                std::string srcPub = bytesToHex(uncompressedKey, uncompressedLen);
+                
+                if (!verify(signatureHex, txDataStr, srcPub)) {
+                    EC_POINT_free(point);
+                    EC_KEY_free(key);
+                    throw std::runtime_error("Invalid signature");
+                }
+                
+                // 3. 데이터 파싱
+                // 3.1 Function name (18바이트)
+                std::string funcName(txData.begin(), txData.begin() + 18);
+                // null 문자 제거
+                funcName = funcName.substr(0, funcName.find('\0'));
+                
+                // 3.2 Source public key는 이미 추출됨 (33바이트)
+                
+                // 3.3 Timestamp (8바이트)
+                uint64_t timestamp = 0;
+                for(int i = 0; i < 8; i++) {
+                    timestamp |= static_cast<uint64_t>(txData[51 + i]) << (i * 8);
+                }
+                
+                // 3.4 암호화된 데이터
+                std::vector<unsigned char> encryptedData(txData.begin() + 59, txData.end());
+                std::string encryptedHex = bytesToHex(encryptedData.data(), encryptedData.size());
+                
+                // 4. 공유키 생성 및 복호화
+                std::string sharedKey = getSharedKey(privateKey, srcPub);
+                std::string decryptedData = decrypt(sharedKey, encryptedHex);
+                
+                // 5. 복호화된 데이터 역직렬화
+                std::vector<std::string> dataList = deserializeDataList(decryptedData);
+                
+                // 6. JSON 형식으로 결과 생성
+                std::stringstream json;
+                json << "{\"funcName\":\"" << funcName << "\","
+                     << "\"srcPub\":\"" << srcPub << "\","
+                     << "\"timeStamp\":\"" << timestamp << "\","
+                     << "\"data\":[";
+                
+                for (size_t i = 0; i < dataList.size(); i++) {
+                    if (i > 0) json << ",";
+                    json << "\"" << dataList[i] << "\"";
+                }
+                json << "]}";
+                
+                EC_POINT_free(point);
+                EC_KEY_free(key);
+                
+                return json.str();
+            }
 };
 
-
+std::string bytesToHexForTest(const unsigned char* data, size_t len) {
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (size_t i = 0; i < len; i++) {
+        ss << std::setw(2) << static_cast<int>(data[i]);
+    }
+    return ss.str();
+}
 
 int main() {
     try {
@@ -556,6 +776,9 @@ int main() {
     }
     
     try{
+        std::cout << "------------------------" << std::endl << std::endl;
+        std::cout << "디바이스 정보 추출 테스트" << std::endl;
+        
         // 디바이스 정보 추출
         std::vector<unsigned char> deviceData = {
            // 33bytes compressed public key
@@ -577,6 +800,28 @@ int main() {
         
         std::string deviceInfo = MatterTunnel::ExtractDeviceInfo(deviceData);
         std::cout << deviceInfo << std::endl;
+    }catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+    
+    try{
+        std::cout << "------------------------" << std::endl << std::endl;
+        std::cout << "트랜잭션 생성 및 추출 테스트" << std::endl;
+        
+        std::string alicePrivateKey = MatterTunnel::generatePrivateKey();
+        std::string alicePublicKey = MatterTunnel::derivePublicKey(alicePrivateKey);
+
+        std::string bobPrivateKey = MatterTunnel::generatePrivateKey();
+        std::string bobPublicKey = MatterTunnel::derivePublicKey(bobPrivateKey);
+        
+        std::vector<std::string> data_list = {"data1", "longer data2"};
+        std::vector<unsigned char> tx = MatterTunnel::makeTX("testFunction", alicePrivateKey,
+                                                             bobPublicKey, data_list);
+        
+        std::cout<< bytesToHexForTest(tx.data(), tx.size()) << std::endl;
+        
+        std::cout<< MatterTunnel::extractTXData(bobPrivateKey, tx) << std::endl;
+        
     }catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
     }
