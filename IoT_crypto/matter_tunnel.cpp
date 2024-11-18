@@ -1,8 +1,5 @@
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
-#include <openssl/obj_mac.h>
-#include <openssl/evp.h>
-#include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/aes.h>
 #include <string>
