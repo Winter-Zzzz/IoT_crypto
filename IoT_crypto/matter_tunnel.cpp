@@ -369,14 +369,14 @@ public:
     }
 
     // 암호화
-    static std::string encrypt(const std::string &key, const std::string &msg)
-    {
-        unsigned char nonce[12];
-        if (RAND_bytes(nonce, sizeof(nonce)) != 1)
-        {
-            throw std::runtime_error("Failed to generate nonce");
+    static std::string encrypt(const std::string &key, const std::string &msg) {
+        // IV 생성 (16 bytes for AES)
+        unsigned char iv[16];
+        if (RAND_bytes(iv, sizeof(iv)) != 1) {
+            throw std::runtime_error("Failed to generate IV");
         }
 
+        // 키 해시 생성 (SHA-256)
         unsigned char keyHash[32];
         EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
         EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr);
@@ -384,87 +384,53 @@ public:
         EVP_DigestFinal_ex(mdctx, keyHash, nullptr);
         EVP_MD_CTX_free(mdctx);
 
-        unsigned char tag[16];
-
-        std::vector<unsigned char> ciphertext(msg.length());
+        // 암호문을 저장할 버퍼 (패딩을 고려하여 msg 길이보다 블록 크기만큼 더 크게)
+        std::vector<unsigned char> ciphertext(msg.length() + EVP_MAX_BLOCK_LENGTH);
         int ciphertext_len;
+        int final_len;
 
-        // CCM 컨텍스트 초기화
+        // CBC 컨텍스트 초기화
         EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-        if (!ctx)
-        {
+        if (!ctx) {
             throw std::runtime_error("Failed to create cipher context");
         }
 
-        // CCM 모드 초기화
-        if (!EVP_EncryptInit_ex(ctx, EVP_aes_128_ccm(), nullptr, nullptr, nullptr))
-        {
+        // CBC 모드 초기화
+        if (!EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, keyHash, iv)) {
             EVP_CIPHER_CTX_free(ctx);
-            throw std::runtime_error("Failed to initialize CCM mode");
-        }
-
-        // CCM 파라미터 설정
-        if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_CCM_SET_IVLEN, sizeof(nonce), nullptr) ||
-            !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_CCM_SET_TAG, sizeof(tag), nullptr))
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            throw std::runtime_error("Failed to set CCM parameters");
-        }
-
-        // 키와 nonce로 암호화 초기화
-        if (!EVP_EncryptInit_ex(ctx, nullptr, nullptr, keyHash, nonce))
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            throw std::runtime_error("Failed to initialize encryption");
-        }
-
-        // 평문 길이 설정
-        if (!EVP_EncryptUpdate(ctx, nullptr, &ciphertext_len, nullptr, msg.length()))
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            throw std::runtime_error("Failed to set message length");
+            throw std::runtime_error("Failed to initialize CBC mode");
         }
 
         // 암호화 수행
         if (!EVP_EncryptUpdate(ctx, ciphertext.data(), &ciphertext_len,
-                               reinterpret_cast<const unsigned char *>(msg.c_str()), msg.length()))
-        {
+                              reinterpret_cast<const unsigned char*>(msg.c_str()),
+                              msg.length())) {
             EVP_CIPHER_CTX_free(ctx);
             throw std::runtime_error("Failed to encrypt message");
         }
 
-        // 암호화 종료 및 태그 얻기
-        if (!EVP_EncryptFinal_ex(ctx, ciphertext.data() + ciphertext_len, &ciphertext_len))
-        {
+        // 암호화 종료 및 패딩 처리
+        if (!EVP_EncryptFinal_ex(ctx, ciphertext.data() + ciphertext_len, &final_len)) {
             EVP_CIPHER_CTX_free(ctx);
             throw std::runtime_error("Failed to finalize encryption");
         }
 
-        if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_CCM_GET_TAG, 16, tag))
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            throw std::runtime_error("Failed to get tag");
-        }
-
         EVP_CIPHER_CTX_free(ctx);
 
-        // nonce(12) + ciphertext + tag(16)를 하나의 문자열로 결합
+        // IV(16) + ciphertext를 하나의 문자열로 결합
         std::string result;
-        result.reserve(12 + msg.length() + 16);
-        result.append(reinterpret_cast<char *>(nonce), 12);
-        result.append(reinterpret_cast<char *>(ciphertext.data()), msg.length());
-        result.append(reinterpret_cast<char *>(tag), 16);
+        result.reserve(16 + ciphertext_len + final_len);
+        result.append(reinterpret_cast<char*>(iv), 16);
+        result.append(reinterpret_cast<char*>(ciphertext.data()), ciphertext_len + final_len);
 
-        return bytesToHex(reinterpret_cast<const unsigned char *>(result.c_str()), result.length());
+        return bytesToHex(reinterpret_cast<const unsigned char*>(result.c_str()), result.length());
     }
 
     // 복호화
-    static std::string decrypt(const std::string &key, const std::string &encryptedHex)
-    {
+    static std::string decrypt(const std::string &key, const std::string &encryptedHex) {
         // 16진수 문자열을 바이트로 변환
         std::vector<unsigned char> encrypted = hexToBytes(encryptedHex);
-        if (encrypted.size() < 28)
-        { // 최소 nonce(12) + tag(16) 필요
+        if (encrypted.size() < 16) { // 최소 IV(16) 필요
             throw std::runtime_error("Invalid encrypted data length");
         }
 
@@ -476,66 +442,48 @@ public:
         EVP_DigestFinal_ex(mdctx, keyHash, nullptr);
         EVP_MD_CTX_free(mdctx);
 
-        // nonce, ciphertext, tag 분리
-        unsigned char *nonce = encrypted.data();
-        size_t ciphertext_len = encrypted.size() - 28;
-        unsigned char *ciphertext = encrypted.data() + 12;
-        unsigned char *tag = encrypted.data() + encrypted.size() - 16;
+        // IV와 암호문 분리
+        unsigned char *iv = encrypted.data();
+        unsigned char *ciphertext = encrypted.data() + 16;
+        int ciphertext_len = encrypted.size() - 16;
 
         // 복호화할 평문 버퍼
-        std::vector<unsigned char> plaintext(ciphertext_len);
+        std::vector<unsigned char> plaintext(ciphertext_len + EVP_MAX_BLOCK_LENGTH);
         int plaintext_len;
+        int final_len;
 
-        // CCM 컨텍스트 초기화
+        // CBC 컨텍스트 초기화
         EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-        if (!ctx)
-        {
+        if (!ctx) {
             throw std::runtime_error("Failed to create cipher context");
         }
 
-        // CCM 모드 초기화
-        if (!EVP_DecryptInit_ex(ctx, EVP_aes_128_ccm(), nullptr, nullptr, nullptr))
-        {
+        // CBC 모드 초기화
+        if (!EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, keyHash, iv)) {
             EVP_CIPHER_CTX_free(ctx);
-            throw std::runtime_error("Failed to initialize CCM mode");
-        }
-
-        // CCM 파라미터 설정
-        if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_CCM_SET_IVLEN, 12, nullptr) ||
-            !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_CCM_SET_TAG, 16, tag))
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            throw std::runtime_error("Failed to set CCM parameters");
-        }
-
-        // 키와 nonce로 복호화 초기화
-        if (!EVP_DecryptInit_ex(ctx, nullptr, nullptr, keyHash, nonce))
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            throw std::runtime_error("Failed to initialize decryption");
-        }
-
-        // 암호문 길이 설정
-        if (!EVP_DecryptUpdate(ctx, nullptr, &plaintext_len, nullptr, ciphertext_len))
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            throw std::runtime_error("Failed to set ciphertext length");
+            throw std::runtime_error("Failed to initialize CBC mode");
         }
 
         // 복호화 수행
-        if (!EVP_DecryptUpdate(ctx, plaintext.data(), &plaintext_len, ciphertext, ciphertext_len))
-        {
+        if (!EVP_DecryptUpdate(ctx, plaintext.data(), &plaintext_len,
+                              ciphertext, ciphertext_len)) {
             EVP_CIPHER_CTX_free(ctx);
-            throw std::runtime_error("Failed to decrypt message or tag verification failed");
+            throw std::runtime_error("Failed to decrypt message");
+        }
+
+        // 복호화 종료 및 패딩 제거
+        if (!EVP_DecryptFinal_ex(ctx, plaintext.data() + plaintext_len, &final_len)) {
+            EVP_CIPHER_CTX_free(ctx);
+            throw std::runtime_error("Failed to finalize decryption");
         }
 
         EVP_CIPHER_CTX_free(ctx);
 
-        return std::string(reinterpret_cast<char *>(plaintext.data()), plaintext_len);
+        return std::string(reinterpret_cast<char*>(plaintext.data()),
+                          plaintext_len + final_len);
     }
-
     // 디바이스 정보 추출
-    static std::string ExtractDeviceInfo(const std::vector<unsigned char> &data)
+    static std::string extractDeviceInfo(const std::vector<unsigned char> &data)
     {
         if (data.size() < 49)
         { // 최소 크기: publicKey(33) + passcode(16)
@@ -664,9 +612,11 @@ public:
 
         // 6.4 Encrypted data
         result.insert(result.end(), encryptedBytes.begin(), encryptedBytes.end());
+        
+        std::string resultHex = bytesToHex(result.data(), result.size());
 
         // 7. 서명 생성 및 추가
-        std::string signature = sign(std::string(result.begin(), result.end()), src_priv);
+        std::string signature = sign(resultHex, src_priv);
         std::vector<unsigned char> signatureBytes = hexToBytes(signature);
 
         // 최종 결과: signature + TX data
@@ -695,7 +645,7 @@ public:
 
         // 2. 서명 검증
         std::string signatureHex = bytesToHex(signature.data(), signature.size());
-        std::string txDataStr(txData.begin(), txData.end());
+        std::string txDataHex = bytesToHex(txData.data(), txData.size());
 
         // compressed public key 추출 (33바이트)
         std::vector<unsigned char> compressedPubKey(txData.begin() + 18, txData.begin() + 51);
@@ -718,7 +668,7 @@ public:
 
         std::string srcPub = bytesToHex(uncompressedKey, uncompressedLen);
 
-        if (!verify(signatureHex, txDataStr, srcPub))
+        if (!verify(signatureHex, txDataHex, srcPub))
         {
             EC_POINT_free(point);
             EC_KEY_free(key);

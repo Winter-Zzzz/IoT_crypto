@@ -77,7 +77,7 @@ public:
     // 디바이스 정보 추출 (Uint8Array를 입력으로 받음)
     static std::string extractDeviceInfo(const val& data) {
         std::vector<unsigned char> vecData = jsArrayToVector(data);
-        return MatterTunnel::ExtractDeviceInfo(vecData);
+        return MatterTunnel::extractDeviceInfo(vecData);
     }
 
     // TX 생성 (결과를 Uint8Array로 반환)
