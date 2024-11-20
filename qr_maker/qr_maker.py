@@ -22,15 +22,15 @@ device_data = bytearray([
     
     # 20bytes function 2 - setLED(number,Boolean) -> void
     ord('s'), ord('e'), ord('t'), ord('L'), ord('E'), ord('D'), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0x8C, 0x00   # number,Boolean args, returns void
+    0xb0, 0x00   # number,Boolean args, returns void
 ])
 
-device_data_text:str = device_data.decode('utf-8', errors='replace')
+device_data_text:str = device_data.decode('latin-1', errors='ignore')
 
 # QR 코드 생성
 qr = qrcode.QRCode(
     version=None,  # 자동으로 최적 버전 선택
-    error_correction=ERROR_CORRECT_M,  # 높은 수준의 오류 정정
+    error_correction=ERROR_CORRECT_L,  # 높은 수준의 오류 정정
     box_size=10,  # QR 코드의 각 박스 크기
     border=4,  # QR 코드 주변의 여백
 )
