@@ -57,7 +57,7 @@ private:
                 result += "number";
                 break;
             case 0x03:
-                result += "Boolean";
+                result += "boolean";
                 break;
             }
         }
@@ -78,7 +78,7 @@ private:
             returnType = "number";
             break;
         case 0x03:
-            returnType = "Boolean";
+            returnType = "boolean";
             break;
         }
 

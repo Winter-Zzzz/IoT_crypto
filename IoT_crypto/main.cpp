@@ -128,7 +128,7 @@ int main()
 
             // 20bytes function 2 - setLED(number,Boolean) -> void
             's', 'e', 't', 'L', 'E', 'D', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0x8C, 0x00 // number,Boolean args, returns void
+            0xb0, 0x00 // number,Boolean args, returns void
         };
 
         std::string deviceInfo = MatterTunnel::extractDeviceInfo(deviceData);
