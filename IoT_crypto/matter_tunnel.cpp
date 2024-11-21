@@ -721,4 +721,76 @@ public:
 
         return json.str();
     }
+    
+    static std::string extractTXDataWithoutSign(const std::string &privateKey, const std::string &txHex)
+    {
+        // 16진수 문자열을 바이트로 변환
+        std::vector<unsigned char> txData = hexToBytes(txHex);
+        
+        if (txData.size() < 59) { // 최소 크기: funcName(18) + compressed pubkey(33) + timestamp(8)
+            throw std::runtime_error("Invalid TX data size");
+        }
+
+        // 1. 데이터 파싱
+        // 1.1 Function name (18바이트)
+        std::string funcName(txData.begin(), txData.begin() + 18);
+        // null 문자 제거
+        funcName = funcName.substr(0, funcName.find('\0'));
+
+        // 1.2 Compressed public key 추출 및 변환 (33바이트)
+        std::vector<unsigned char> compressedPubKey(txData.begin() + 18, txData.begin() + 51);
+
+        // compressed public key를 uncompressed form으로 변환
+        EC_KEY *key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+        const EC_GROUP *group = EC_KEY_get0_group(key);
+        EC_POINT *point = EC_POINT_new(group);
+
+        if (!EC_POINT_oct2point(group, point, compressedPubKey.data(), compressedPubKey.size(), nullptr)) {
+            EC_POINT_free(point);
+            EC_KEY_free(key);
+            throw std::runtime_error("Failed to decompress public key");
+        }
+
+        unsigned char uncompressedKey[65];
+        size_t uncompressedLen = EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED,
+                                                    uncompressedKey, 65, nullptr);
+
+        std::string srcPub = bytesToHex(uncompressedKey, uncompressedLen);
+
+        // 1.3 Timestamp (8바이트)
+        uint64_t timestamp = 0;
+        for (int i = 0; i < 8; i++) {
+            timestamp |= static_cast<uint64_t>(txData[51 + i]) << (i * 8);
+        }
+
+        // 1.4 암호화된 데이터
+        std::vector<unsigned char> encryptedData(txData.begin() + 59, txData.end());
+        std::string encryptedHex = bytesToHex(encryptedData.data(), encryptedData.size());
+
+        // 2. 공유키 생성 및 복호화
+        std::string sharedKey = getSharedKey(privateKey, srcPub);
+        std::string decryptedData = decrypt(sharedKey, encryptedHex);
+
+        // 3. 복호화된 데이터 역직렬화
+        std::vector<std::string> dataList = deserializeDataList(decryptedData);
+
+        // 4. JSON 형식으로 결과 생성
+        std::stringstream json;
+        json << "{\"funcName\":\"" << funcName << "\","
+             << "\"srcPub\":\"" << srcPub << "\","
+             << "\"timeStamp\":\"" << timestamp << "\","
+             << "\"data\":[";
+
+        for (size_t i = 0; i < dataList.size(); i++) {
+            if (i > 0)
+                json << ",";
+            json << "\"" << dataList[i] << "\"";
+        }
+        json << "]}";
+
+        EC_POINT_free(point);
+        EC_KEY_free(key);
+
+        return json.str();
+    }
 };
